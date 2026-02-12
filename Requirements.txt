@@ -1,15 +1,5 @@
-# Interface Web
-streamlit>=1.30.0
-
-# Processamento Biológico e Leitura de .ab1
-biopython>=1.81
-
-# Manipulação de Dados e Tabelas
-pandas>=2.0.0
-numpy>=1.24.0
-
-# Visualização Interativa (Cromatogramas com Zoom)
-plotly>=5.18.0
-
-# Dependências opcionais para exportar dados (caso precise no futuro)
-openpyxl>=3.1.0
+streamlit
+biopython
+pandas
+plotly
+numpy
