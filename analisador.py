@@ -18,41 +18,59 @@ st.set_page_config(page_title="Sanger Pro Viewer", layout="wide")
 def obter_dados_sanger(record):
     """
     Extrai os traços (ondas), a sequência original, a posição dos picos (PLOC) 
-    e a qualidade (Phred).
+    e a qualidade (Phred) de forma extremamente defensiva.
     """
-    canais = ['DATA9', 'DATA10', 'DATA11', 'DATA12'] 
-    mapa_bases = {'DATA9': 'G', 'DATA10': 'A', 'DATA11': 'T', 'DATA12': 'C'}
-    
-    # Cores pasteis suaves para as linhas e fundo
-    cores_linhas = {'G': '#9E9E9E', 'A': '#81C784', 'T': '#E57373', 'C': '#64B5F6'}
-    cores_fundo = {'G': 'rgba(158,158,158,0.2)', 'A': 'rgba(129,199,132,0.2)', 'T': 'rgba(229,115,115,0.2)', 'C': 'rgba(100,181,246,0.2)'}
+    cores_linhas = {'G': '#9E9E9E', 'A': '#81C784', 'T': '#E57373', 'C': '#64B5F6', 'N': '#000000'}
+    cores_fundo = {'G': 'rgba(158,158,158,0.2)', 'A': 'rgba(129,199,132,0.2)', 'T': 'rgba(229,115,115,0.2)', 'C': 'rgba(100,181,246,0.2)', 'N': 'rgba(0,0,0,0)'}
     
     tracos = {}
+    ploc = []
+    qualidade = []
     
     if 'abif_raw' in record.annotations:
         raw = record.annotations['abif_raw']
         
+        # 1. Descobrir dinamicamente quais canais a máquina usou
+        canais = ['DATA9', 'DATA10', 'DATA11', 'DATA12'] if 'DATA9' in raw else ['DATA1', 'DATA2', 'DATA3', 'DATA4']
+        
+        # 2. Obter a ordem das cores (Flight Wheel Order) do ficheiro
+        fwo = raw.get('FWO_1', b'GATC')
+        if isinstance(fwo, bytes):
+            fwo = fwo.decode('utf-8', errors='ignore')
+        ordem_bases = list(fwo) if len(fwo) >= 4 else ['G', 'A', 'T', 'C']
+        
+        mapa_bases = {}
+        for i in range(4):
+            if i < len(canais) and i < len(ordem_bases):
+                mapa_bases[canais[i]] = ordem_bases[i]
+        
+        # 3. Extrair os traços com proteção
         for canal in canais:
             if canal in raw:
-                base = mapa_bases[canal]
-                tracos[base] = list(raw[canal])
+                try:
+                    base = mapa_bases.get(canal, 'N')
+                    tracos[base] = list(raw[canal])
+                except Exception:
+                    pass
         
-        ploc = raw.get('PLOC_1', raw.get('PLOC_2', []))
+        # 4. Procura as posições dos picos (PLOC)
+        ploc_raw = raw.get('PLOC_1', raw.get('PLOC_2', raw.get('PLOC1', raw.get('PLOC2', []))))
+        try:
+            ploc = list(ploc_raw) if ploc_raw is not None else []
+        except Exception:
+            ploc = []
         
-        # Tentar extrair qualidade Phred
-        qualidade = record.letter_annotations.get("phred_quality", [0]*len(ploc))
-        
-        return tracos, ploc, qualidade, cores_linhas, cores_fundo
-    return None, None, None, None, None
+        # 5. Tentar extrair qualidade Phred
+        try:
+            qual_raw = record.letter_annotations.get("phred_quality", [])
+            qualidade = list(qual_raw) if qual_raw else [0]*len(ploc)
+        except Exception:
+            qualidade = [0]*len(ploc)
+            
+    return tracos, ploc, qualidade, cores_linhas, cores_fundo
 
 def cor_da_letra(base):
-    # Mantemos as letras com o mesmo tom pastel das linhas
-    cores_pasteis = {
-        'A': '#81C784', 
-        'T': '#E57373', 
-        'C': '#64B5F6', 
-        'G': '#9E9E9E'
-    }
+    cores_pasteis = {'A': '#81C784', 'T': '#E57373', 'C': '#64B5F6', 'G': '#9E9E9E'}
     return cores_pasteis.get(base, 'gray')
 
 # --- INTERFACE PRINCIPAL ---
@@ -74,10 +92,30 @@ with st.sidebar:
 if ficheiro_carregado:
     try:
         dados_bytes = ficheiro_carregado.read()
-        record = SeqIO.read(io.BytesIO(dados_bytes), "abi")
         
+        # PROTEÇÃO 1: Intercetar erros nativos do Biopython ao ler o ficheiro
+        try:
+            record = SeqIO.read(io.BytesIO(dados_bytes), "abi")
+        except IndexError:
+            st.error("⚠️ O Biopython não conseguiu processar a estrutura interna deste ficheiro .ab1. O ficheiro pode ter sido modificado por outro software ou usar um formato de cabeçalho não standard.")
+            st.stop()
+        except Exception as e:
+            st.error(f"⚠️ Erro ao ler o ficheiro: {str(e)}")
+            st.stop()
+            
         tracos, plocs, qualidade, cores, cores_fundo = obter_dados_sanger(record)
         
+        # FALLBACK: Estimar posições se a máquina não gravou os Picos (PLOC)
+        if not plocs and tracos:
+            try:
+                valores_tracos = list(tracos.values())
+                tamanho_traco = len(valores_tracos[0]) if valores_tracos and len(valores_tracos[0]) > 0 else 0
+                tamanho_seq = len(record.seq) if len(record.seq) > 0 else 1
+                passo_estimado = tamanho_traco / tamanho_seq
+                plocs = [int(i * passo_estimado) for i in range(len(record.seq))]
+            except Exception:
+                plocs = []
+
         # Inicialização do estado da sessão
         if 'seq_editada' not in st.session_state or st.session_state.get('id_ficheiro') != ficheiro_carregado.name:
             st.session_state['seq_editada'] = str(record.seq)
@@ -90,7 +128,13 @@ if ficheiro_carregado:
             st.subheader("Modo de Edição (Estilo SnapGene)")
             
             seq_atual = st.session_state['seq_editada']
-            limite = min(len(plocs), len(seq_atual)) if plocs else len(seq_atual)
+            
+            # Garantir limite seguro (Nunca superior aos dados que efetivamente temos)
+            limite = 0
+            if plocs and seq_atual:
+                limite = min(len(plocs), len(seq_atual))
+            elif seq_atual:
+                limite = len(seq_atual)
             
             # --- PAINEL DE CONTROLO DO CURSOR ---
             col_nav1, col_nav2, col_edit, col_vazio = st.columns([1.5, 2, 2, 2])
@@ -101,19 +145,24 @@ if ficheiro_carregado:
                 if btn_esq.button("⬅️ Ant."):
                     st.session_state['cursor_pos'] = max(1, st.session_state['cursor_pos'] - 1)
                 if btn_dir.button("Seg. ➡️"):
-                    st.session_state['cursor_pos'] = min(limite, st.session_state['cursor_pos'] + 1)
+                    st.session_state['cursor_pos'] = min(max(limite, 1), st.session_state['cursor_pos'] + 1)
             
             with col_nav2:
                 st.number_input(
                     "📍 Ir para a Posição:", 
                     min_value=1, 
-                    max_value=limite, 
+                    max_value=max(limite, 1), # Evita erro se o limite for 0
                     key="cursor_pos"
                 )
             
             with col_edit:
                 idx_atual = st.session_state['cursor_pos'] - 1
-                base_atual = seq_atual[idx_atual]
+                
+                # Proteção de acesso rigorosa
+                if 0 <= idx_atual < len(seq_atual):
+                    base_atual = seq_atual[idx_atual]
+                else:
+                    base_atual = ""
                 
                 nova_base = st.text_input(
                     f"Substituir base {idx_atual + 1}:", 
@@ -123,88 +172,95 @@ if ficheiro_carregado:
                 
                 if nova_base and nova_base != base_atual and nova_base in ['A', 'C', 'T', 'G', 'N', '-']:
                     seq_lista = list(st.session_state['seq_editada'])
-                    seq_lista[idx_atual] = nova_base
-                    st.session_state['seq_editada'] = "".join(seq_lista)
-                    st.rerun()
+                    if 0 <= idx_atual < len(seq_lista):
+                        seq_lista[idx_atual] = nova_base
+                        st.session_state['seq_editada'] = "".join(seq_lista)
+                        st.rerun()
             st.markdown("---")
 
-            # --- CONSTRUÇÃO DO GRÁFICO PLOTLY (ESTILO SNAPGENE) ---
+            # --- CONSTRUÇÃO DO GRÁFICO PLOTLY ---
             fig = go.Figure()
             valor_maximo = 0
 
-            # 1. Desenhar as ondas com preenchimento (estilo SnapGene)
+            # 1. Desenhar as ondas
             if tracos:
                 for base, dados in tracos.items():
-                    dados_escalados = [d * escala_vertical for d in dados]
-                    if dados_escalados:
-                        valor_maximo = max(valor_maximo, max(dados_escalados))
-                    
-                    fig.add_trace(go.Scatter(
-                        y=dados_escalados,
-                        name=f"Canal {base}",
-                        mode='lines',
-                        line=dict(color=cores[base], width=1.5),
-                        fill='tozeroy',           # Preenchimento
-                        fillcolor=cores_fundo[base], # Cor transparente
-                        hoverinfo='skip'
-                    ))
+                    try:
+                        dados_escalados = [d * escala_vertical for d in dados]
+                        if dados_escalados:
+                            valor_maximo = max(valor_maximo, max(dados_escalados))
+                        
+                        fig.add_trace(go.Scatter(
+                            y=dados_escalados,
+                            name=f"Canal {base}",
+                            mode='lines',
+                            line=dict(color=cores.get(base, 'gray'), width=1.5),
+                            fill='tozeroy',
+                            fillcolor=cores_fundo.get(base, 'rgba(0,0,0,0)'),
+                            hoverinfo='skip'
+                        ))
+                    except Exception:
+                        continue
 
             # Preparar as letras coloridas
             lista_plocs = list(plocs)[:limite]
             lista_letras = list(seq_atual)[:limite]
             cores_letras = [cor_da_letra(b) for b in lista_letras]
             
-            # Hover text com a qualidade (Phred)
-            textos_hover = [f"Posição: {i+1}<br>Qualidade (Phred): {qualidade[i] if i < len(qualidade) else 'N/A'}" for i in range(limite)]
+            # Hover text protegido
+            textos_hover = []
+            for i in range(limite):
+                qual = qualidade[i] if (qualidade and 0 <= i < len(qualidade)) else 'N/A'
+                textos_hover.append(f"Posição: {i+1}<br>Qualidade (Phred): {qual}")
 
-            # 2. Desenhar todas as letras no topo
-            fig.add_trace(go.Scatter(
-                x=lista_plocs, 
-                y=[valor_maximo * 1.05] * limite, 
-                text=lista_letras,
-                mode="text",
-                textfont=dict(size=14, color=cores_letras, family="monospace", weight="bold"),
-                name="Sequência",
-                hovertext=textos_hover,
-                hoverinfo="text"
-            ))
+            # 2. Desenhar as letras no topo
+            if lista_plocs and lista_letras:
+                fig.add_trace(go.Scatter(
+                    x=lista_plocs, 
+                    y=[valor_maximo * 1.05] * len(lista_plocs), 
+                    text=lista_letras,
+                    mode="text",
+                    textfont=dict(size=14, color=cores_letras, family="monospace", weight="bold"),
+                    name="Sequência",
+                    hovertext=textos_hover,
+                    hoverinfo="text"
+                ))
 
-            # 3. Adicionar marcadores verticais a cada 10 bases (Linha do tempo)
+            # 3. Adicionar marcadores verticais a cada 10 bases
             for i in range(9, limite, 10):
-                fig.add_vline(x=plocs[i], line_width=1, line_dash="dot", line_color="rgba(128,128,128,0.5)")
-                fig.add_annotation(
-                    x=plocs[i], y=0, 
-                    text=str(i+1), showarrow=False, 
-                    yshift=-20, font=dict(color="gray", size=10)
-                )
+                if 0 <= i < len(plocs):
+                    fig.add_vline(x=plocs[i], line_width=1, line_dash="dot", line_color="rgba(128,128,128,0.5)")
+                    fig.add_annotation(
+                        x=plocs[i], y=0, 
+                        text=str(i+1), showarrow=False, 
+                        yshift=-20, font=dict(color="gray", size=10)
+                    )
 
-            # 4. Desenhar o CURSOR (Sombra / Destaque)
-            if plocs and idx_atual < len(plocs):
+            # 4. Desenhar o CURSOR
+            if plocs and 0 <= idx_atual < len(plocs):
                 x_cursor = plocs[idx_atual]
                 
-                # Fundo azul claro no pico atual (como no SnapGene)
-                largura_pico = 15 # estimativa de largura
+                largura_pico = 15
                 fig.add_vrect(
                     x0=x_cursor - largura_pico, x1=x_cursor + largura_pico,
                     fillcolor="rgba(0, 150, 255, 0.2)",
                     layer="below", line_width=0,
                 )
                 
-                # Destacar a letra com uma caixa no topo
-                fig.add_annotation(
-                    x=x_cursor,
-                    y=valor_maximo * 1.05,
-                    text=seq_atual[idx_atual],
-                    showarrow=False,
-                    font=dict(color="white", size=16, weight="bold"),
-                    bgcolor="rgba(0, 100, 255, 0.8)",
-                    bordercolor="darkblue", borderwidth=1, borderpad=3
-                )
+                if 0 <= idx_atual < len(seq_atual):
+                    fig.add_annotation(
+                        x=x_cursor,
+                        y=valor_maximo * 1.05,
+                        text=seq_atual[idx_atual],
+                        showarrow=False,
+                        font=dict(color="white", size=16, weight="bold"),
+                        bgcolor="rgba(0, 100, 255, 0.8)",
+                        bordercolor="darkblue", borderwidth=1, borderpad=3
+                    )
 
-            # 5. Cálculo Dinâmico da Janela de Zoom (Para não espremer tudo)
-            centro_x = plocs[idx_atual] if (plocs and idx_atual < len(plocs)) else 0
-            # Mostrar metade das bases pedidas para a esquerda e metade para a direita
-            raio_zoom = zoom_horizontal * 15 # 15 é a distância média aproximada entre picos
+            # 5. Cálculo Dinâmico da Janela de Zoom
+            centro_x = plocs[idx_atual] if (plocs and 0 <= idx_atual < len(plocs)) else 0
+            raio_zoom = zoom_horizontal * 15 
             
             x_min = max(0, centro_x - raio_zoom)
             x_max = centro_x + raio_zoom
@@ -212,12 +268,12 @@ if ficheiro_carregado:
             # 6. Layout Final
             fig.update_layout(
                 height=450,
-                showlegend=False, # Ocultar legenda para ter mais espaço limpo
+                showlegend=False,
                 plot_bgcolor='white',
                 margin=dict(l=10, r=10, t=30, b=40),
                 xaxis=dict(
                     title="Posição do Traço",
-                    range=[x_min, x_max], # <- A MÁGICA ESTÁ AQUI (Auto-Zoom no Cursor)
+                    range=[x_min, x_max],
                     rangeslider=dict(visible=True, thickness=0.08),
                     showgrid=False,
                     zeroline=False
@@ -259,16 +315,19 @@ if ficheiro_carregado:
                     aligner.extend_gap_score = -1
                     
                     alinhamentos = aligner.align(seq_referencia, st.session_state['seq_editada'])
-                    melhor_alinhamento = alinhamentos[0]
                     
-                    st.metric("Pontuação do Alinhamento (Score)", melhor_alinhamento.score)
-                    st.text("Visão do Alinhamento:")
-                    st.code(str(melhor_alinhamento), language='text')
+                    try:
+                        melhor_alinhamento = alinhamentos[0]
+                        st.metric("Pontuação do Alinhamento (Score)", melhor_alinhamento.score)
+                        st.text("Visão do Alinhamento:")
+                        st.code(str(melhor_alinhamento), language='text')
+                    except Exception:
+                        st.warning("⚠️ Não foi encontrado nenhum alinhamento compatível entre as sequências.")
             else:
                 st.warning("Insere uma sequência de referência na barra lateral para efetuar o alinhamento.")
 
     except Exception as e:
-        st.error(f"Ocorreu um erro ao processar o ficheiro: {e}")
+        st.error(f"Ocorreu um erro geral ao processar o ficheiro: {str(e)}")
 
 else:
     st.info("👈 Começa por carregar um ficheiro .ab1 na barra lateral.")
