@@ -1,6 +1,6 @@
 # ==========================================
 # REQUISITOS (guardar num ficheiro requirements.txt):
-# streamlit>=1.35.0   <-- ATENÇÃO: É necessário o Streamlit 1.35 ou superior para eventos de clique!
+# streamlit>=1.30.0
 # biopython>=1.81
 # plotly>=5.18.0
 # ==========================================
@@ -59,20 +59,66 @@ if ficheiro_carregado:
         
         tracos, plocs, cores = obter_dados_sanger(record)
         
+        # Inicialização do estado da sessão
         if 'seq_editada' not in st.session_state or st.session_state.get('id_ficheiro') != ficheiro_carregado.name:
             st.session_state['seq_editada'] = str(record.seq)
             st.session_state['id_ficheiro'] = ficheiro_carregado.name
+            st.session_state['cursor_pos'] = 1  # Iniciar o cursor na posição 1
 
         tab_grafico, tab_alinhamento = st.tabs(["📊 Cromatograma Interativo", "🔍 Alinhamento Global"])
 
         with tab_grafico:
-            st.subheader("Cromatograma (Clica numa letra para editá-ar)")
-            st.info("💡 **Dica:** Usa a barra de rolagem abaixo do gráfico para navegar. **Clica em qualquer letra** por cima dos picos para a corrigires.")
+            st.subheader("Modo de Edição (Estilo SnapGene)")
+            st.info("💡 Usa os controlos abaixo para mover o **Cursor Vermelho** no gráfico. Assim que estiver no pico desejado, altera a base na caixa.")
             
+            seq_atual = st.session_state['seq_editada']
+            limite = min(len(plocs), len(seq_atual)) if plocs else len(seq_atual)
+            
+            # --- PAINEL DE CONTROLO DO CURSOR ---
+            st.markdown("---")
+            col_nav1, col_nav2, col_edit, col_vazio = st.columns([1.5, 2, 2, 2])
+            
+            with col_nav1:
+                st.write("**Navegação Rápida**")
+                btn_esq, btn_dir = st.columns(2)
+                if btn_esq.button("⬅️ Ant."):
+                    st.session_state['cursor_pos'] = max(1, st.session_state['cursor_pos'] - 1)
+                if btn_dir.button("Seg. ➡️"):
+                    st.session_state['cursor_pos'] = min(limite, st.session_state['cursor_pos'] + 1)
+            
+            with col_nav2:
+                # O widget number_input atualiza diretamente a variável de sessão 'cursor_pos'
+                st.number_input(
+                    "📍 Ir para a Posição:", 
+                    min_value=1, 
+                    max_value=limite, 
+                    key="cursor_pos"
+                )
+            
+            with col_edit:
+                # Posição atual baseada no cursor (1-indexado para o utilizador, 0-indexado para a lista)
+                idx_atual = st.session_state['cursor_pos'] - 1
+                base_atual = seq_atual[idx_atual]
+                
+                nova_base = st.text_input(
+                    f"Substituir base {idx_atual + 1}:", 
+                    value=base_atual, 
+                    max_chars=1
+                ).upper()
+                
+                # Guardar a edição
+                if nova_base and nova_base != base_atual and nova_base in ['A', 'C', 'T', 'G', 'N']:
+                    seq_lista = list(st.session_state['seq_editada'])
+                    seq_lista[idx_atual] = nova_base
+                    st.session_state['seq_editada'] = "".join(seq_lista)
+                    st.rerun()
+            st.markdown("---")
+
+            # --- CONSTRUÇÃO DO GRÁFICO PLOTLY ---
             fig = go.Figure()
             valor_maximo = 0
 
-            # 1. Desenhar as ondas
+            # 1. Desenhar as ondas (traces)
             if tracos:
                 for base, dados in tracos.items():
                     dados_escalados = [d * escala_vertical for d in dados]
@@ -87,28 +133,39 @@ if ficheiro_carregado:
                         hoverinfo='skip'
                     ))
 
-            # 2. Desenhar as bases (Clicáveis)
-            seq_atual = st.session_state['seq_editada']
-            limite = min(len(plocs), len(seq_atual))
-            
-            # Adicionamos 'customdata' para identificar qual o índice (posição) que foi clicado
-            indices = list(range(limite))
-            
+            # 2. Desenhar todas as bases no topo dos picos
             fig.add_trace(go.Scatter(
                 x=list(plocs)[:limite], 
                 y=[valor_maximo * 1.05] * limite, 
                 text=list(seq_atual)[:limite],
                 mode="text",
-                textfont=dict(size=14, color="black", weight="bold"),
-                name="Bases (Clicáveis)",
-                customdata=indices, 
-                hovertext=["Clique para editar" for _ in range(limite)],
-                hoverinfo="text"
+                textfont=dict(size=14, color="black"),
+                name="Bases Chamadas"
             ))
 
+            # 3. Desenhar o CURSOR VERMELHO (Estilo SnapGene)
+            if plocs and idx_atual < len(plocs):
+                x_cursor = plocs[idx_atual]
+                
+                # Linha vertical
+                fig.add_vline(x=x_cursor, line_width=2, line_dash="dash", line_color="rgba(255, 0, 0, 0.7)")
+                
+                # Destaque na letra atual (Caixa vermelha)
+                fig.add_annotation(
+                    x=x_cursor,
+                    y=valor_maximo * 1.05,
+                    text=seq_atual[idx_atual],
+                    showarrow=False,
+                    font=dict(color="white", size=16, weight="bold"),
+                    bgcolor="red",
+                    bordercolor="darkred",
+                    borderwidth=2,
+                    borderpad=4
+                )
+
+            # 4. Configurações de layout (Zoom e Pan)
             fig.update_layout(
                 height=450,
-                clickmode='event+select', # Permite seleção por clique
                 showlegend=True,
                 plot_bgcolor='white',
                 margin=dict(l=10, r=10, t=30, b=10),
@@ -126,49 +183,12 @@ if ficheiro_carregado:
                 )
             )
 
-            # 3. Renderizar o gráfico com eventos de seleção ativados (REQUER STREAMLIT >= 1.35)
-            selecao = st.plotly_chart(
-                fig, 
-                use_container_width=True, 
-                on_select="rerun",           # O script reinicia quando algo é selecionado
-                selection_mode="points",     # Selecionar pontos únicos (as letras)
-                key="grafico_sanger"
-            )
+            st.plotly_chart(fig, use_container_width=True)
 
-            # 4. Lógica de Interceção do Clique
-            pontos_clicados = selecao.selection.get("points", [])
-            # Procurar se algum ponto clicado tem 'customdata' (que são as nossas letras)
-            ponto_base = next((p for p in pontos_clicados if "customdata" in p), None)
-
-            if ponto_base:
-                # Extrair o índice exato da sequência que o utilizador clicou
-                idx_clicado = ponto_base["customdata"]
-                base_antiga = seq_atual[idx_clicado]
-                
-                # Interface de edição cirúrgica!
-                st.warning(f"👉 **Modo de Edição:** Selecionaste a base na posição **{idx_clicado + 1}** (Atual: **{base_antiga}**)")
-                
-                col_input, col_espaco = st.columns([1, 3])
-                with col_input:
-                    # Campo de texto minúsculo focado apenas numa letra
-                    nova_base = st.text_input(
-                        "Escreve a nova letra e prime Enter:", 
-                        value=base_antiga, 
-                        max_chars=1, 
-                        key=f"input_base_{idx_clicado}"
-                    ).upper()
-                    
-                    # Se o utilizador alterar a letra, aplicamos na sequência e atualizamos o estado
-                    if nova_base and nova_base != base_antiga and nova_base in ['A', 'C', 'T', 'G', 'N']:
-                        seq_lista = list(st.session_state['seq_editada'])
-                        seq_lista[idx_clicado] = nova_base
-                        st.session_state['seq_editada'] = "".join(seq_lista)
-                        st.rerun() # Atualiza o gráfico instantaneamente
-
-            # Bloco opcional (para visualização do todo, agora fechado num expansor)
-            with st.expander("Ver sequência completa em modo texto"):
+            # --- EDITOR EM MASSA ---
+            with st.expander("🛠️ Ver/Editar a sequência completa em modo de texto"):
                 nova_seq_texto = st.text_area(
-                    "Sequência Extraída",
+                    "Podes colar uma sequência inteira aqui se preferires:",
                     value=st.session_state['seq_editada'],
                     height=100
                 ).upper().strip()
