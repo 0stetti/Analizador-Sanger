@@ -1,184 +1,197 @@
+# ==========================================
+# REQUISITOS (guardar num ficheiro requirements.txt):
+# streamlit>=1.30.0
+# biopython>=1.81
+# plotly>=5.18.0
+# ==========================================
+
 import streamlit as st
 from Bio import SeqIO
-from Bio.Align import PairwiseAligner, AlignInfo
-from Bio.Seq import Seq
-from Bio.SeqRecord import SeqRecord
-from Bio.Align import MultipleSeqAlignment
+from Bio.Align import PairwiseAligner
 import plotly.graph_objects as go
-import numpy as np
 import io
 
-# Configuração da página
-st.set_page_config(page_title="Sanger Editor & Aligner", layout="wide")
+# Configuração inicial da página
+st.set_page_config(page_title="Sanger Pro Viewer", layout="wide")
 
-# --- GERENCIAMENTO DE ESTADO (SESSION STATE) ---
-# Isso é crucial para manter as edições do usuário na memória
-if 'reads_data' not in st.session_state:
-    st.session_state['reads_data'] = {} # Dicionário para guardar {nome_arquivo: sequencia_editada}
-
-def get_chromatogram_traces(record):
-    """Extrai os canais de cor do arquivo AB1"""
-    channels = ['DATA9', 'DATA10', 'DATA11', 'DATA12'] # G, A, T, C (Padrão ABI)
-    colors = {'G': 'black', 'A': 'green', 'T': 'red', 'C': 'blue'}
-    bases = ['G', 'A', 'T', 'C']
-    traces = {}
+# --- FUNÇÕES DE PROCESSAMENTO ---
+def obter_dados_sanger(record):
+    """
+    Extrai os traços (ondas), a sequência original e a posição exata dos picos (PLOC).
+    """
+    # Canais padrão ABI para G, A, T, C
+    canais = ['DATA9', 'DATA10', 'DATA11', 'DATA12'] 
+    mapa_bases = {'DATA9': 'G', 'DATA10': 'A', 'DATA11': 'T', 'DATA12': 'C'}
+    cores = {'G': 'black', 'A': 'green', 'T': 'red', 'C': 'blue'}
     
-    # Tenta extrair os canais raw do arquivo
+    tracos = {}
+    
+    # Extrair os dados brutos (raw data)
     if 'abif_raw' in record.annotations:
         raw = record.annotations['abif_raw']
-        for i, channel in enumerate(channels):
-            if channel in raw:
-                traces[bases[i]] = list(raw[channel])
-    return traces
-
-def plot_chromatogram(traces, sequence_length):
-    """Gera o gráfico interativo com Plotly"""
-    fig = go.Figure()
-    
-    # Adiciona cada canal ao gráfico
-    colors = {'G': 'black', 'A': 'green', 'T': 'red', 'C': 'blue'}
-    for base, data in traces.items():
-        if data:
-            fig.add_trace(go.Scatter(
-                y=data, 
-                mode='lines', 
-                name=base, 
-                line=dict(color=colors[base], width=1),
-                opacity=0.7
-            ))
-            
-    fig.update_layout(
-        title="Visualização do Cromatograma (Zoom Interativo)",
-        height=300,
-        margin=dict(l=20, r=20, t=40, b=20),
-        xaxis_title="Posição do Trace",
-        yaxis_title="Intensidade de Fluorescência",
-        legend_title="Bases"
-    )
-    return fig
+        
+        # 1. Extrair as ondas de fluorescência
+        for canal in canais:
+            if canal in raw:
+                base = mapa_bases[canal]
+                tracos[base] = list(raw[canal])
+        
+        # 2. Extrair as Posições dos Picos (Peak Locations - PLOC)
+        # O PLOC diz-nos exatamente em que coordenada X a máquina detetou a base
+        ploc = raw.get('PLOC_1', raw.get('PLOC_2', []))
+        
+        return tracos, ploc, cores
+    return None, None, None
 
 # --- INTERFACE PRINCIPAL ---
+st.title("🧬 Sanger Pro: Visualização e Alinhamento")
 
-st.title("🧬 Sanger Master: Edição e Alinhamento")
-
-# 1. INPUTS NA SIDEBAR
+# --- BARRA LATERAL (CONTROLES E UPLOAD) ---
 with st.sidebar:
-    st.header("1. Upload e Referência")
+    st.header("1. Carregar Dados")
+    ficheiro_carregado = st.file_uploader("Ficheiro .ab1", type=["ab1"])
     
-    # Upload Múltiplo
-    uploaded_files = st.file_uploader("Subir arquivos .ab1", type=["ab1"], accept_multiple_files=True)
-    
-    # Processar novos arquivos
-    if uploaded_files:
-        for uploaded_file in uploaded_files:
-            if uploaded_file.name not in st.session_state['reads_data']:
-                try:
-                    # Ler o arquivo binário
-                    bytes_data = uploaded_file.read()
-                    record = SeqIO.read(io.BytesIO(bytes_data), "abi")
-                    
-                    # Salvar no estado
-                    st.session_state['reads_data'][uploaded_file.name] = {
-                        'original_seq': str(record.seq),
-                        'edited_seq': str(record.seq), # Começa igual a original
-                        'traces': get_chromatogram_traces(record),
-                        'record_obj': record
-                    }
-                except Exception as e:
-                    st.error(f"Erro ao ler {uploaded_file.name}: {e}")
-            # Resetar ponteiro do arquivo para não dar erro se o streamlit recarregar
-            uploaded_file.seek(0)
-
     st.markdown("---")
-    ref_seq_input = st.text_area("Sequência Teórica (Referência)", height=150, placeholder="Cole aqui a sequência do gene esperado (ex: mclover 3)...").upper().strip()
-
-# --- ABAS DA APLICAÇÃO ---
-tab_editor, tab_results = st.tabs(["✏️ Editor de Sequências", "📊 Alinhamento e Consenso"])
-
-with tab_editor:
-    st.subheader("Visualizar e Editar Bases")
+    st.header("2. Controlos de Visualização")
+    escala_vertical = st.slider("Amplitude dos Picos (Zoom Vertical)", 1.0, 10.0, 1.0, 0.1)
     
-    if not st.session_state['reads_data']:
-        st.info("Faça upload de arquivos .ab1 na barra lateral para começar.")
-    
-    # Loop pelos arquivos carregados para criar editores individuais
-    for filename, data in st.session_state['reads_data'].items():
-        with st.expander(f"Arquivo: {filename}", expanded=True):
+    st.markdown("---")
+    st.header("3. Referência (Opcional)")
+    seq_referencia = st.text_area("Sequência Teórica (ex: mclover 3)", height=150).upper().strip()
+
+# --- ÁREA DE TRABALHO ---
+if ficheiro_carregado:
+    try:
+        # Ler o ficheiro binário em memória
+        dados_bytes = ficheiro_carregado.read()
+        record = SeqIO.read(io.BytesIO(dados_bytes), "abi")
+        
+        # Extrair os dados complexos do cromatograma
+        tracos, plocs, cores = obter_dados_sanger(record)
+        
+        # Inicializar o estado da sessão para manter as edições do utilizador
+        if 'seq_editada' not in st.session_state or st.session_state.get('id_ficheiro') != ficheiro_carregado.name:
+            st.session_state['seq_editada'] = str(record.seq)
+            st.session_state['id_ficheiro'] = ficheiro_carregado.name
+
+        st.success(f"Ficheiro '{ficheiro_carregado.name}' carregado com sucesso!")
+
+        # Separar a interface em separadores (Tabs)
+        tab_grafico, tab_alinhamento = st.tabs(["📊 Cromatograma e Edição", "🔍 Alinhamento"])
+
+        # ==========================================
+        # SEPARADOR 1: GRÁFICO E EDIÇÃO
+        # ==========================================
+        with tab_grafico:
+            st.subheader("Cromatograma Interativo")
             
-            # 1. Plota o gráfico (Cromatograma)
-            if data['traces']:
-                st.plotly_chart(plot_chromatogram(data['traces'], len(data['original_seq'])), use_container_width=True)
-            else:
-                st.warning("Dados de traço (traces) não encontrados neste arquivo.")
+            fig = go.Figure()
+            valor_maximo = 0
 
-            # 2. Área de Edição
-            col1, col2 = st.columns([3, 1])
+            # 1. Desenhar as ondas
+            if tracos:
+                for base, dados in tracos.items():
+                    # Aplicar a escala vertical para aumentar picos baixos
+                    dados_escalados = [d * escala_vertical for d in dados]
+                    if dados_escalados:
+                        valor_maximo = max(valor_maximo, max(dados_escalados))
+                    
+                    fig.add_trace(go.Scatter(
+                        y=dados_escalados,
+                        name=base,
+                        mode='lines',
+                        line=dict(color=cores[base], width=1),
+                        hoverinfo='skip' # Melhora a performance
+                    ))
+
+            # 2. Desenhar as letras no topo dos picos (usando o PLOC)
+            seq_atual = st.session_state['seq_editada']
+            limite = min(len(plocs), len(seq_atual))
+            
+            fig.add_trace(go.Scatter(
+                x=list(plocs)[:limite], 
+                y=[valor_maximo * 1.05] * limite, # Colocar a 5% acima do pico mais alto
+                text=list(seq_atual)[:limite],
+                mode="text",
+                textfont=dict(size=14, color="black"),
+                name="Bases Chamadas"
+            ))
+
+            # 3. Configurar o layout com a barra de deslocamento (Range Slider)
+            fig.update_layout(
+                height=450,
+                showlegend=True,
+                plot_bgcolor='white',
+                margin=dict(l=10, r=10, t=30, b=10),
+                xaxis=dict(
+                    title="Posição do Traço",
+                    rangeslider=dict(visible=True), # Barra de deslocamento horizontal
+                    showgrid=True,
+                    gridcolor='lightgrey'
+                ),
+                yaxis=dict(
+                    title="Intensidade",
+                    showgrid=True,
+                    gridcolor='lightgrey',
+                    fixedrange=False # Permite zoom no eixo Y
+                )
+            )
+
+            st.plotly_chart(fig, use_container_width=True)
+
+            # 4. Caixa de Edição
+            st.markdown("### ✏️ Editor de Bases")
+            st.info("Altera a sequência abaixo. O gráfico será atualizado automaticamente com as novas letras.")
+            
+            col1, col2 = st.columns([4, 1])
             with col1:
-                # Onde a mágica acontece: O usuário edita, e nós salvamos no Session State
-                new_seq = st.text_area(
-                    f"Sequência de Bases ({filename})", 
-                    value=data['edited_seq'], 
-                    height=100,
-                    key=f"editor_{filename}" # Chave única para persistência
+                nova_seq = st.text_area(
+                    "Sequência Extraída",
+                    value=st.session_state['seq_editada'],
+                    height=150
                 ).upper().strip()
                 
-                # Atualiza o estado se houve mudança
-                if new_seq != data['edited_seq']:
-                    st.session_state['reads_data'][filename]['edited_seq'] = new_seq
-                    st.toast(f"Sequência de {filename} atualizada!", icon="✅")
+                # Se o utilizador editar, atualizar o estado e recarregar
+                if nova_seq != st.session_state['seq_editada']:
+                    st.session_state['seq_editada'] = nova_seq
+                    st.rerun()
             
             with col2:
-                st.write("Estatísticas:")
-                st.caption(f"Tamanho Original: {len(data['original_seq'])} bp")
-                st.caption(f"Tamanho Atual: {len(new_seq)} bp")
-                if new_seq != data['original_seq']:
-                    st.caption("⚠️ **Editado Manualmente**")
+                st.write("**Estatísticas**")
+                st.metric("Tamanho Original", len(plocs))
+                st.metric("Tamanho Editado", len(nova_seq))
+                if len(nova_seq) != len(plocs):
+                    st.warning("⚠️ O tamanho foi alterado. O alinhamento visual com os picos pode perder a sincronia.")
 
-with tab_results:
-    st.subheader("Alinhamento Global")
-    
-    if ref_seq_input and st.session_state['reads_data']:
-        if st.button("Rodar Alinhamento"):
-            aligner = PairwiseAligner()
-            aligner.mode = 'local' # Local é melhor para achar a região de interesse
-            aligner.match_score = 2
-            aligner.mismatch_score = -1
-            aligner.open_gap_score = -2
-            aligner.extend_gap_score = -1
+        # ==========================================
+        # SEPARADOR 2: ALINHAMENTO
+        # ==========================================
+        with tab_alinhamento:
+            st.subheader("Alinhamento com Sequência Teórica")
             
-            st.markdown("### Resultados por Amostra")
-            
-            valid_sequences = [] # Lista para gerar consenso
-            
-            # Alinha cada sequência editada contra a referência
-            for filename, data in st.session_state['reads_data'].items():
-                seq_usuario = data['edited_seq']
-                alignment = aligner.align(ref_seq_input, seq_usuario)[0]
-                
-                st.markdown(f"**Amostra:** `{filename}` | Score: {alignment.score}")
-                st.code(str(alignment), language='text')
-                
-                # Adiciona à lista para tentar consenso (somente se tiver tamanho similar)
-                # Nota: Consenso real requer Multiple Sequence Alignment (MSA), 
-                # aqui faremos uma aproximação visual empilhando os dados
-                valid_sequences.append(SeqRecord(Seq(seq_usuario), id=filename))
-            
-            st.divider()
-            st.markdown("### Resumo / Consenso Simplificado")
-            st.info("Para um consenso verdadeiro, seria ideal usar algoritmos de MSA (como Muscle). Abaixo, uma visão das sequências carregadas:")
-            
-            # Mostra as sequências brutas uma em cima da outra para comparação visual rápida
-            df_display = {
-                "Nome do Arquivo": [],
-                "Sequência (Início)": [],
-                "Sequência (Fim)": []
-            }
-            for v in valid_sequences:
-                df_display["Nome do Arquivo"].append(v.id)
-                df_display["Sequência (Início)"].append(str(v.seq)[:50] + "...")
-                df_display["Sequência (Fim)"].append("..." + str(v.seq)[-50:])
-            
-            st.dataframe(df_display)
+            if seq_referencia:
+                if st.button("Executar Alinhamento", type="primary"):
+                    # Configurar o algoritmo de alinhamento
+                    aligner = PairwiseAligner()
+                    aligner.mode = 'local'
+                    aligner.match_score = 2
+                    aligner.mismatch_score = -1
+                    aligner.open_gap_score = -2
+                    aligner.extend_gap_score = -1
+                    
+                    # Executar usando a sequência EDITADA pelo utilizador
+                    alinhamentos = aligner.align(seq_referencia, st.session_state['seq_editada'])
+                    melhor_alinhamento = alinhamentos[0]
+                    
+                    st.metric("Pontuação do Alinhamento (Score)", melhor_alinhamento.score)
+                    st.text("Visão do Alinhamento:")
+                    st.code(str(melhor_alinhamento), language='text')
+            else:
+                st.warning("Insere uma sequência de referência na barra lateral para efetuar o alinhamento.")
 
-    else:
-        st.warning("Por favor, certifique-se de ter carregado arquivos .ab1 E inserido uma sequência de referência.")
+    except Exception as e:
+        st.error(f"Ocorreu um erro ao processar o ficheiro: {e}")
+
+else:
+    # Ecrã inicial quando não há ficheiros
+    st.info("👈 Começa por carregar um ficheiro .ab1 na barra lateral.")
