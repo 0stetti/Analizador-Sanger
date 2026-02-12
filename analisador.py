@@ -1,6 +1,6 @@
 # ==========================================
 # REQUISITOS (guardar num ficheiro requirements.txt):
-# streamlit>=1.30.0
+# streamlit>=1.35.0   <-- ATENÇÃO: É necessário o Streamlit 1.35 ou superior para eventos de clique!
 # biopython>=1.81
 # plotly>=5.18.0
 # ==========================================
@@ -19,34 +19,27 @@ def obter_dados_sanger(record):
     """
     Extrai os traços (ondas), a sequência original e a posição exata dos picos (PLOC).
     """
-    # Canais padrão ABI para G, A, T, C
     canais = ['DATA9', 'DATA10', 'DATA11', 'DATA12'] 
     mapa_bases = {'DATA9': 'G', 'DATA10': 'A', 'DATA11': 'T', 'DATA12': 'C'}
     cores = {'G': 'black', 'A': 'green', 'T': 'red', 'C': 'blue'}
     
     tracos = {}
     
-    # Extrair os dados brutos (raw data)
     if 'abif_raw' in record.annotations:
         raw = record.annotations['abif_raw']
         
-        # 1. Extrair as ondas de fluorescência
         for canal in canais:
             if canal in raw:
                 base = mapa_bases[canal]
                 tracos[base] = list(raw[canal])
         
-        # 2. Extrair as Posições dos Picos (Peak Locations - PLOC)
-        # O PLOC diz-nos exatamente em que coordenada X a máquina detetou a base
         ploc = raw.get('PLOC_1', raw.get('PLOC_2', []))
-        
         return tracos, ploc, cores
     return None, None, None
 
 # --- INTERFACE PRINCIPAL ---
 st.title("🧬 Sanger Pro: Visualização e Alinhamento")
 
-# --- BARRA LATERAL (CONTROLES E UPLOAD) ---
 with st.sidebar:
     st.header("1. Carregar Dados")
     ficheiro_carregado = st.file_uploader("Ficheiro .ab1", type=["ab1"])
@@ -59,31 +52,22 @@ with st.sidebar:
     st.header("3. Referência (Opcional)")
     seq_referencia = st.text_area("Sequência Teórica (ex: mclover 3)", height=150).upper().strip()
 
-# --- ÁREA DE TRABALHO ---
 if ficheiro_carregado:
     try:
-        # Ler o ficheiro binário em memória
         dados_bytes = ficheiro_carregado.read()
         record = SeqIO.read(io.BytesIO(dados_bytes), "abi")
         
-        # Extrair os dados complexos do cromatograma
         tracos, plocs, cores = obter_dados_sanger(record)
         
-        # Inicializar o estado da sessão para manter as edições do utilizador
         if 'seq_editada' not in st.session_state or st.session_state.get('id_ficheiro') != ficheiro_carregado.name:
             st.session_state['seq_editada'] = str(record.seq)
             st.session_state['id_ficheiro'] = ficheiro_carregado.name
 
-        st.success(f"Ficheiro '{ficheiro_carregado.name}' carregado com sucesso!")
+        tab_grafico, tab_alinhamento = st.tabs(["📊 Cromatograma Interativo", "🔍 Alinhamento Global"])
 
-        # Separar a interface em separadores (Tabs)
-        tab_grafico, tab_alinhamento = st.tabs(["📊 Cromatograma e Edição", "🔍 Alinhamento"])
-
-        # ==========================================
-        # SEPARADOR 1: GRÁFICO E EDIÇÃO
-        # ==========================================
         with tab_grafico:
-            st.subheader("Cromatograma Interativo")
+            st.subheader("Cromatograma (Clica numa letra para editá-ar)")
+            st.info("💡 **Dica:** Usa a barra de rolagem abaixo do gráfico para navegar. **Clica em qualquer letra** por cima dos picos para a corrigires.")
             
             fig = go.Figure()
             valor_maximo = 0
@@ -91,7 +75,6 @@ if ficheiro_carregado:
             # 1. Desenhar as ondas
             if tracos:
                 for base, dados in tracos.items():
-                    # Aplicar a escala vertical para aumentar picos baixos
                     dados_escalados = [d * escala_vertical for d in dados]
                     if dados_escalados:
                         valor_maximo = max(valor_maximo, max(dados_escalados))
@@ -101,31 +84,37 @@ if ficheiro_carregado:
                         name=base,
                         mode='lines',
                         line=dict(color=cores[base], width=1),
-                        hoverinfo='skip' # Melhora a performance
+                        hoverinfo='skip'
                     ))
 
-            # 2. Desenhar as letras no topo dos picos (usando o PLOC)
+            # 2. Desenhar as bases (Clicáveis)
             seq_atual = st.session_state['seq_editada']
             limite = min(len(plocs), len(seq_atual))
             
+            # Adicionamos 'customdata' para identificar qual o índice (posição) que foi clicado
+            indices = list(range(limite))
+            
             fig.add_trace(go.Scatter(
                 x=list(plocs)[:limite], 
-                y=[valor_maximo * 1.05] * limite, # Colocar a 5% acima do pico mais alto
+                y=[valor_maximo * 1.05] * limite, 
                 text=list(seq_atual)[:limite],
                 mode="text",
-                textfont=dict(size=14, color="black"),
-                name="Bases Chamadas"
+                textfont=dict(size=14, color="black", weight="bold"),
+                name="Bases (Clicáveis)",
+                customdata=indices, 
+                hovertext=["Clique para editar" for _ in range(limite)],
+                hoverinfo="text"
             ))
 
-            # 3. Configurar o layout com a barra de deslocamento (Range Slider)
             fig.update_layout(
                 height=450,
+                clickmode='event+select', # Permite seleção por clique
                 showlegend=True,
                 plot_bgcolor='white',
                 margin=dict(l=10, r=10, t=30, b=10),
                 xaxis=dict(
                     title="Posição do Traço",
-                    rangeslider=dict(visible=True), # Barra de deslocamento horizontal
+                    rangeslider=dict(visible=True),
                     showgrid=True,
                     gridcolor='lightgrey'
                 ),
@@ -133,35 +122,59 @@ if ficheiro_carregado:
                     title="Intensidade",
                     showgrid=True,
                     gridcolor='lightgrey',
-                    fixedrange=False # Permite zoom no eixo Y
+                    fixedrange=False
                 )
             )
 
-            st.plotly_chart(fig, use_container_width=True)
+            # 3. Renderizar o gráfico com eventos de seleção ativados (REQUER STREAMLIT >= 1.35)
+            selecao = st.plotly_chart(
+                fig, 
+                use_container_width=True, 
+                on_select="rerun",           # O script reinicia quando algo é selecionado
+                selection_mode="points",     # Selecionar pontos únicos (as letras)
+                key="grafico_sanger"
+            )
 
-            # 4. Caixa de Edição
-            st.markdown("### ✏️ Editor de Bases")
-            st.info("Altera a sequência abaixo. O gráfico será atualizado automaticamente com as novas letras.")
-            
-            col1, col2 = st.columns([4, 1])
-            with col1:
-                nova_seq = st.text_area(
+            # 4. Lógica de Interceção do Clique
+            pontos_clicados = selecao.selection.get("points", [])
+            # Procurar se algum ponto clicado tem 'customdata' (que são as nossas letras)
+            ponto_base = next((p for p in pontos_clicados if "customdata" in p), None)
+
+            if ponto_base:
+                # Extrair o índice exato da sequência que o utilizador clicou
+                idx_clicado = ponto_base["customdata"]
+                base_antiga = seq_atual[idx_clicado]
+                
+                # Interface de edição cirúrgica!
+                st.warning(f"👉 **Modo de Edição:** Selecionaste a base na posição **{idx_clicado + 1}** (Atual: **{base_antiga}**)")
+                
+                col_input, col_espaco = st.columns([1, 3])
+                with col_input:
+                    # Campo de texto minúsculo focado apenas numa letra
+                    nova_base = st.text_input(
+                        "Escreve a nova letra e prime Enter:", 
+                        value=base_antiga, 
+                        max_chars=1, 
+                        key=f"input_base_{idx_clicado}"
+                    ).upper()
+                    
+                    # Se o utilizador alterar a letra, aplicamos na sequência e atualizamos o estado
+                    if nova_base and nova_base != base_antiga and nova_base in ['A', 'C', 'T', 'G', 'N']:
+                        seq_lista = list(st.session_state['seq_editada'])
+                        seq_lista[idx_clicado] = nova_base
+                        st.session_state['seq_editada'] = "".join(seq_lista)
+                        st.rerun() # Atualiza o gráfico instantaneamente
+
+            # Bloco opcional (para visualização do todo, agora fechado num expansor)
+            with st.expander("Ver sequência completa em modo texto"):
+                nova_seq_texto = st.text_area(
                     "Sequência Extraída",
                     value=st.session_state['seq_editada'],
-                    height=150
+                    height=100
                 ).upper().strip()
-                
-                # Se o utilizador editar, atualizar o estado e recarregar
-                if nova_seq != st.session_state['seq_editada']:
-                    st.session_state['seq_editada'] = nova_seq
+                if nova_seq_texto != st.session_state['seq_editada']:
+                    st.session_state['seq_editada'] = nova_seq_texto
                     st.rerun()
-            
-            with col2:
-                st.write("**Estatísticas**")
-                st.metric("Tamanho Original", len(plocs))
-                st.metric("Tamanho Editado", len(nova_seq))
-                if len(nova_seq) != len(plocs):
-                    st.warning("⚠️ O tamanho foi alterado. O alinhamento visual com os picos pode perder a sincronia.")
 
         # ==========================================
         # SEPARADOR 2: ALINHAMENTO
@@ -171,7 +184,6 @@ if ficheiro_carregado:
             
             if seq_referencia:
                 if st.button("Executar Alinhamento", type="primary"):
-                    # Configurar o algoritmo de alinhamento
                     aligner = PairwiseAligner()
                     aligner.mode = 'local'
                     aligner.match_score = 2
@@ -179,7 +191,6 @@ if ficheiro_carregado:
                     aligner.open_gap_score = -2
                     aligner.extend_gap_score = -1
                     
-                    # Executar usando a sequência EDITADA pelo utilizador
                     alinhamentos = aligner.align(seq_referencia, st.session_state['seq_editada'])
                     melhor_alinhamento = alinhamentos[0]
                     
@@ -193,5 +204,4 @@ if ficheiro_carregado:
         st.error(f"Ocorreu um erro ao processar o ficheiro: {e}")
 
 else:
-    # Ecrã inicial quando não há ficheiros
     st.info("👈 Começa por carregar um ficheiro .ab1 na barra lateral.")
